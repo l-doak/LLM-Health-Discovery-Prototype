@@ -1,0 +1,12 @@
+{
+  "_comment": "Domains the discovery stage is allowed to treat as candidate sources. This is a starting set for the prototype, not a comprehensive one — see docs/limitations.md.",
+  "domains": [
+    "nhs.uk",
+    "who.int",
+    "ageuk.org.uk",
+    "nia.nih.gov",
+    "nice.org.uk",
+    "nlm.nih.gov",
+    "mayoclinic.org"
+  ]
+}
