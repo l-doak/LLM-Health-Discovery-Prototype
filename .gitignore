@@ -1,0 +1,18 @@
+# --- Secrets ---
+.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# --- Generated data (not source-controlled — created at runtime) ---
+data/steadi.db
+data/audit_log.jsonl
+
+# --- OS/editor cruft ---
+.DS_Store
+.vscode/

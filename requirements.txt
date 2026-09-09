@@ -1,0 +1,28 @@
+# --- Core LLM + search ---
+anthropic>=0.40.0          # Claude API client (tool use / structured output)
+tavily-python>=0.5.0       # Tavily search API — free tier, simple REST wrapper
+
+# --- Fetching + parsing web pages ---
+requests>=2.31.0           # HTTP requests to fetch candidate source pages
+beautifulsoup4>=4.12.0     # Strip HTML down to readable text
+lxml>=5.0.0                # Fast parser backend for BeautifulSoup
+
+# --- Data modelling + storage ---
+pydantic>=2.7.0            # Schema-enforced models (Source, ContentDraft, etc.)
+# sqlite3 is in the Python standard library — no package needed
+
+# --- Config ---
+python-dotenv>=1.0.0       # Load API keys from a local .env file (gitignored)
+
+# --- RAG (added when we reach the summarization/draft stages) ---
+sentence-transformers>=3.0.0
+chromadb>=0.5.0
+
+# --- Review UI (added when we reach the human-review stage) ---
+flask>=3.0.0
+
+# --- Evaluation ---
+textstat>=0.7.3            # Flesch-Kincaid readability scoring
+
+# --- Testing ---
+pytest>=8.0.0
