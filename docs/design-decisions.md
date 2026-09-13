@@ -105,3 +105,93 @@ generic way to tell those apart — see `docs/limitations.md`.
 NLM, Mayo Clinic) to keep the discovery scope focused on
 frailty/mobility-relevant, clearly authoritative sources rather than
 casting a wide net early.
+
+
+
+=============================================================================================================
+
+
+## Session 2 — stage 2 (structured summarization) design decisions
+
+**Separate `summaries` table, not new columns on `sources`.** Keeps
+`sources` a stage-1-only concern (mirrors how `content_drafts` is already
+its own table rather than being bolted onto `sources`), and lets a source
+be re-summarized — a failed attempt retried, or a prompt version bump
+re-run — without destroying the previous attempt. Every summarization run
+inserts a new row rather than overwriting. `db.get_latest_summary` reads
+back the one row that matters for the pipeline (the most recent attempt);
+the full history stays queryable via `db.list_summaries` for audit
+purposes and for the "evaluation-driven retries" idea in
+`agent-engineering-roadmap.md`.
+
+**Structured output via forced tool-use, not prompted JSON.** `summarize.py`
+defines a `record_summary` tool schema matching the `Summary` fields and
+calls the API with `tool_choice={"type": "tool", "name": "record_summary"}`.
+This guarantees a well-formed arguments object instead of relying on the
+model to emit clean JSON in prose (which models sometimes wrap in markdown
+fences or precede with a sentence of preamble). The tool's `input` is still
+passed through the `Summary` Pydantic model as a second validation layer.
+
+**`prompt_version` convention: a hand-bumped module constant, not a hash
+or a full prompt snapshot.** `summarize.py` has `PROMPT_VERSION =
+"summarize_v1"`, bumped manually whenever the prompt template's wording
+changes meaningfully. The audit log stores this label — not the literal
+prompt text — against every summarization event. This is a deliberate
+simplification: reconstructing the *exact* prompt used for a past event
+means checking out the matching git commit, not just reading the audit
+log. A production system handling this at scale would more likely
+snapshot the literal prompt text per call (or per version) so the audit
+trail is self-contained. Flagged in `docs/limitations.md`.
+
+**`model_version` is captured from the API response (`response.model`),
+not hardcoded.** The `MODEL` constant tells the API which model to *call*,
+but what gets stored per summary is what the API actually reports back —
+so if Anthropic silently routes a request to a slightly different model
+snapshot, the audit record still reflects reality.
+
+**Error handling: per-source try/except, with a small fixed retry only
+for transient errors.** One bad source (a blocked page, a malformed
+model response, a rate limit) shouldn't stop the whole batch. Transient
+errors (`anthropic.RateLimitError`, `anthropic.APIConnectionError`) get
+up to `MAX_RETRIES` attempts with a short linear backoff; anything else
+(validation errors, the model failing to call the tool at all) fails
+immediately without retrying, since retrying wouldn't help. Either way,
+a failed source is left at `status="discovered"` — untouched, not marked
+failed — so a future run naturally picks it back up. This is a "retry the
+network," not "retry because the content was bad" strategy; the latter is
+explicitly future scope once stage 5's grounding check exists to judge
+content quality (see `agent-engineering-roadmap.md`'s planning-loop idea).
+
+**Sources with missing/very short `raw_text` are skipped before calling
+the API at all**, rather than sent and left to fail there — cheap local
+check (`MIN_RAW_TEXT_CHARS = 50`), saves an API call on pages that
+fetched effectively empty (e.g. JS-rendered content BeautifulSoup
+couldn't see).
+
+
+## Session 2 (continued) — non-HTML content handling in discovery.py
+
+Found via real usage, not anticipated in the original design: a NICE
+evidence-document URL turned out to be a PDF, and `discovery.py`'s fetch
+step (plain `requests` + BeautifulSoup, no content-type check) "parsed"
+the raw PDF bytes as HTML anyway — nothing stops BeautifulSoup succeeding
+on binary content, since a PDF has no `<tags>` for it to strip. This
+silently stored ~840,000 characters of near-garbage text as a source's
+`raw_text`, which later broke `summarize.py` (Claude's 200k-token request
+limit) — see the summarize.py truncation-cap entry above for the other
+half of this same incident.
+
+**Fix:** `fetch_page_text` now checks the response's `Content-Type`
+header, and separately checks the raw bytes for the PDF magic number
+(`%PDF-`) as a fallback in case a server mislabels its `Content-Type` —
+either check raises a new `NotHTMLContentError`, which `discover()`
+catches and logs as `decision="skipped_non_html_content"` (distinct from
+a generic `fetch_failed`, so the audit log honestly reflects *why* a
+source didn't make it through) rather than storing anything.
+
+**Deliberately not built now:** actually extracting text from PDFs (e.g.
+via `pypdf`) so this content could be used rather than skipped. Several
+allowlisted domains (NICE, NIA) publish real evidence as PDFs, so this is
+a real gap, not just an edge case — flagged as a documented future
+enhancement in `docs/limitations.md` rather than solved here, to keep
+this fix focused on stopping the immediate breakage.

@@ -75,3 +75,56 @@ project brief and the original job description's emphasis on this.
   the open question in `docs/schema.md`) — it currently accepts any
   string, which undermines the "agreed schema" goal for tags
   specifically (categories are already locked down).
+
+
+=================================================================================================================
+
+## Session 2 — stage 2 (structured summarization) limitations
+
+- **`prompt_version` is a label, not a snapshot.** The audit log records
+  which named prompt version produced a summary, but not the literal
+  prompt text — that lives only in the git history of `summarize.py` at
+  the time. A production system doing this for real would likely store
+  the actual prompt text (or a hash of it) per call, so the audit trail
+  is self-contained and doesn't depend on the codebase's git history
+  still being intact/accessible years later.
+- **`Summary.target_audience` is free text, not a controlled vocabulary.**
+  Same open item as `ContentDraft.tags` in `docs/schema.md` — worth
+  deciding a fixed vocabulary for both together, since they likely
+  overlap, before building `draft.py`.
+- **Retries only cover transient API failures (rate limits, connection
+  errors), not content quality.** If the model produces a technically
+  valid but poor summary (e.g. a claim that isn't really in the source
+  text), `summarize.py` has no way to detect or retry that today — it
+  will be stored and flipped to `pending_review` as-is, relying entirely
+  on the human reviewer (stage 3) to catch it. An automated grounding
+  check (stage 5) closing this loop, and feeding back into a retry, is
+  explicitly future scope per `agent-engineering-roadmap.md`.
+- **No de-duplication of summarization attempts.** If `run_summarization`
+  is run twice against the same source before a human reviews it (e.g. a
+  re-run after a code change), a second `summaries` row is created rather
+  than being blocked — by design, so retries work — but this means it's
+  possible to accumulate multiple pending attempts for one source with no
+  automatic cleanup of the older ones. `db.get_latest_summary` always
+  picks the most recent, so this doesn't cause incorrect behavior today,
+  but the older rows are dead weight that a real system would probably
+  want to prune or mark superseded.
+- **`Source` still has no `reviewed_by` / `reviewed_at` fields.** Not
+  needed until stage 3 (`review.py`) actually makes the approve/reject
+  decision — deferred rather than added speculatively now.
+
+  ## Session 2 (continued) — PDF sources are skipped, not summarized
+
+`discovery.py` now detects and skips non-HTML responses (PDFs, primarily)
+rather than mis-parsing them as HTML — see `docs/design-decisions.md` for
+how this was found (a NICE evidence PDF broke `summarize.py`'s token
+limit before this fix existed). The practical consequence: any source
+that's actually a PDF is currently invisible to the rest of the pipeline
+entirely, even when its content would be genuinely useful (NICE guidance
+evidence, some NIA publications). A production version of this system
+would need real PDF text extraction (e.g. `pypdf` or a dedicated
+document-parsing step) as its own input path, not just an HTML fetcher.
+Not built here — deliberately scoped out as a **documented future
+enhancement**, to keep this fix focused on stopping the immediate
+breakage (silently storing ~840k characters of PDF binary as if it were
+page text) rather than growing it into a bigger feature.
