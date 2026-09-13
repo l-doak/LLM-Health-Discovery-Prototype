@@ -24,18 +24,26 @@ is the right-sized tool.
 WHAT'S IN THIS FILE
 --------------------
 1. `Source`      — a candidate source found during discovery.
-2. `ContentDraft`— a generated piece of app content (built in a later
+2. `Summary`      — a structured summary of a Source, produced by the
+                    summarization stage. A Source can have more than one
+                    Summary row over time (e.g. a failed attempt retried
+                    with a newer prompt version) — each summarization run
+                    inserts a new row rather than overwriting, so the
+                    summaries table is a full history, not just current
+                    state. `get_latest_summary` returns the one that
+                    matters for the pipeline (the most recent attempt).
+3. `ContentDraft`- a generated piece of app content (built in a later
                     stage, but modelled now so the schema is settled
                     early — see docs/schema.md).
-3. `init_db()`   — creates both tables if they don't exist yet.
-4. CRUD-ish helper functions for `Source`, since that's what the
-   discovery stage needs today. Draft-related helpers will be added when
-   we build draft.py, so this file doesn't get ahead of itself with
-   untested code for a stage we haven't built yet.
+4. `init_db()`   — creates all tables if they don't exist yet.
+5. CRUD-ish helper functions for `Source` and `Summary`. Draft-related
+   helpers will be added when we build draft.py, so this file doesn't get
+   ahead of itself with untested code for a stage we haven't built yet.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -87,6 +95,38 @@ class Source(BaseModel):
     )
 
 
+class Summary(BaseModel):
+    """A structured summary of a Source, produced by the summarization
+    stage (src/summarize.py).
+
+    Deliberately a separate table from `sources` rather than extra
+    columns on it, for two reasons: (1) it keeps `sources` a stage-1-only
+    concern, mirroring how `content_drafts` is already its own table
+    rather than being bolted onto `sources`; and (2) it lets a source be
+    re-summarized (a failed attempt retried, or a prompt update re-run)
+    without destroying the previous attempt — every summarization run is
+    a new row, not an overwrite. `target_audience` is free text for now,
+    same "not yet a controlled vocabulary" caveat as `ContentDraft.tags`
+    — see docs/limitations.md.
+
+    There's deliberately no `status` field here: the human review
+    decision (stage 3) is recorded on `Source.status`
+    (`approved`/`rejected`), not on the Summary itself.
+    """
+
+    summary_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    source_id: str
+    title: str
+    key_claims: list[str]
+    target_audience: str
+    credibility_notes: str
+    model_version: str
+    prompt_version: str
+    generated_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
 class ContentDraft(BaseModel):
     """A generated app-content draft, matching docs/schema.md.
 
@@ -130,7 +170,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create the `sources` and `content_drafts` tables if they don't exist.
+    """Create all tables if they don't exist yet.
 
     Safe to call every time the app starts — `CREATE TABLE IF NOT EXISTS`
     is a no-op once the tables are already there.
@@ -147,6 +187,22 @@ def init_db() -> None:
                 raw_text       TEXT NOT NULL,
                 status         TEXT NOT NULL,
                 discovered_at  TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                summary_id         TEXT PRIMARY KEY,
+                source_id          TEXT NOT NULL,
+                title              TEXT NOT NULL,
+                key_claims         TEXT NOT NULL,  -- JSON-encoded list
+                target_audience    TEXT NOT NULL,
+                credibility_notes  TEXT NOT NULL,
+                model_version      TEXT NOT NULL,
+                prompt_version     TEXT NOT NULL,
+                generated_at       TEXT NOT NULL,
+                FOREIGN KEY (source_id) REFERENCES sources (source_id)
             )
             """
         )
@@ -251,5 +307,111 @@ def update_source_status(source_id: str, status: SourceStatus) -> None:
             (status, source_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_source(source_id: str) -> None:
+    """Delete a source and any summaries associated with it.
+
+    This is NOT part of normal pipeline flow — the pipeline itself only
+    ever changes a source's status, never deletes rows, so the audit
+    trail stays intact for anything that actually went through the
+    pipeline. This exists for removing genuinely bad data instead: e.g. a
+    source whose raw_text turned out to be a mis-fetched PDF rather than
+    real page content (see discovery.py's NotHTMLContentError, added
+    after hitting exactly this). SQLite's foreign key from summaries to
+    sources isn't set up with ON DELETE CASCADE, so summaries are deleted
+    explicitly first to avoid leaving orphaned rows.
+    """
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM summaries WHERE source_id = ?", (source_id,))
+        conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --- Summary CRUD helpers --------------------------------------------------
+
+
+def insert_summary(summary: Summary) -> None:
+    """Insert a new summary row. Does NOT touch Source.status — callers
+    (summarize.py) are responsible for calling update_source_status
+    separately, so a summary can be stored and inspected even if the
+    status transition step were ever to fail independently.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO summaries
+                (summary_id, source_id, title, key_claims, target_audience,
+                 credibility_notes, model_version, prompt_version, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                summary.summary_id,
+                summary.source_id,
+                summary.title,
+                json.dumps(summary.key_claims),
+                summary.target_audience,
+                summary.credibility_notes,
+                summary.model_version,
+                summary.prompt_version,
+                summary.generated_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_latest_summary(source_id: str) -> Summary | None:
+    """Return the most recent summary for a source (by generated_at), or
+    None if it hasn't been successfully summarized yet. This is what the
+    human review stage should read — not list_summaries — since only the
+    latest attempt is the one awaiting a decision.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM summaries
+            WHERE source_id = ?
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["key_claims"] = json.loads(data["key_claims"])
+        return Summary(**data)
+    finally:
+        conn.close()
+
+
+def list_summaries(source_id: str | None = None) -> list[Summary]:
+    """List all summary attempts, optionally filtered to one source.
+    Mostly useful for debugging and audit review (e.g. "show me every
+    attempt at summarizing this source"), not the main pipeline path.
+    """
+    conn = get_connection()
+    try:
+        if source_id is None:
+            rows = conn.execute("SELECT * FROM summaries").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM summaries WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        results = []
+        for row in rows:
+            data = dict(row)
+            data["key_claims"] = json.loads(data["key_claims"])
+            results.append(Summary(**data))
+        return results
     finally:
         conn.close()
