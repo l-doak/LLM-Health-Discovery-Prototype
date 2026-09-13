@@ -22,14 +22,24 @@ DESIGN DECISIONS
 - Domain filtering happens BEFORE fetching. There's no point spending a
   network request fetching a page we're going to discard anyway — and it
   means a malicious/irrelevant URL never even gets downloaded.
-- Fetching uses plain `requests` + BeautifulSoup rather than a headless
-  browser (e.g. Playwright). Most health-org pages are static HTML, and a
-  full browser is much slower and heavier. Trade-off: this will produce
+- Fetching uses plain `requests` + BeautifulSoup.
+  Most health-org pages are static HTML, and a full browser is much slower
+  and heavier. Trade-off: this will produce
   poor/empty text for pages that render their content with JavaScript —
   worth noting in docs/limitations.md if you hit that in practice.
 - Every source is logged via audit.log_event, including ones that get
   filtered out or fail to fetch — auditability means recording what
   DIDN'T make it through, not just what did.
+- Non-HTML responses (PDFs, images, etc.) are detected and skipped rather
+  than parsed as if they were HTML — see fetch_page_text and
+  NotHTMLContentError below. This was added after a real NICE evidence
+  URL turned out to be a PDF: BeautifulSoup "parsed" the raw PDF bytes as
+  if they were HTML (there's nothing that stops it — a PDF has no <tags>
+  for it to strip), producing ~840k characters of near-garbage text that
+  later broke summarization (a 200k-token API limit). Real PDF text
+  extraction (e.g. via pypdf) would let this content actually be used
+  rather than just skipped — flagged as a documented future enhancement
+  in docs/limitations.md, not built now.
 """
 
 from __future__ import annotations
@@ -67,6 +77,26 @@ REQUEST_HEADERS = {
 
 # Fetching a slow or hung server shouldn't stall the whole discovery run.
 FETCH_TIMEOUT_SECONDS = 10
+
+
+class NotHTMLContentError(Exception):
+    """Raised by fetch_page_text when a response isn't HTML/text content
+    (e.g. a PDF, image, or other binary document).
+
+    Fetching succeeded — this isn't a network failure — but the content
+    shouldn't be parsed as HTML: BeautifulSoup will "succeed" on binary
+    bytes (there's no markup for it to strip), producing large amounts of
+    near-garbage text that wastes storage and breaks later stages (e.g.
+    blowing past summarize.py's token limit). Kept as a distinct
+    exception (rather than just returning None like other fetch
+    failures) so discover() can log a specific, honest reason
+    ("skipped_non_html_content") instead of lumping it in with generic
+    fetch failures.
+    """
+
+    def __init__(self, content_type: str):
+        self.content_type = content_type
+        super().__init__(f"Non-HTML content type: {content_type!r}")
 
 
 def load_allowlist() -> set[str]:
@@ -156,6 +186,11 @@ def fetch_page_text(url: str) -> str | None:
     """Download a URL and return its readable text content, or None on
     failure (network error, non-200 status, or no extractable text).
 
+    Raises NotHTMLContentError if the response isn't HTML — this is
+    deliberately NOT folded into the None-on-failure case, so the caller
+    can tell "we couldn't get anything" apart from "we got something,
+    but it wasn't a web page" and log/handle each honestly.
+
     WHY BeautifulSoup + get_text() rather than something fancier:
     this is a simple, dependency-light way to strip HTML tags, scripts,
     and styles down to plain text. It won't be as clean as a dedicated
@@ -171,6 +206,20 @@ def fetch_page_text(url: str) -> str | None:
         response.raise_for_status()
     except requests.RequestException:
         return None
+
+    # Primary check: trust the server's stated Content-Type.
+    content_type = response.headers.get("Content-Type", "")
+    if "html" not in content_type.lower():
+        raise NotHTMLContentError(content_type)
+
+    # Defense in depth: some servers mislabel what they serve. We don't
+    # know whether the NICE URL that motivated this check sent a correct
+    # "application/pdf" Content-Type (most likely it did, and the bug was
+    # simply that nothing here checked it before this fix) or an
+    # incorrect one — either way, checking the actual bytes for the PDF
+    # magic number catches it regardless of what the header claims.
+    if response.content[:5] == b"%PDF-":
+        raise NotHTMLContentError(content_type or "application/pdf (detected by content)")
 
     soup = BeautifulSoup(response.text, "lxml")
 
@@ -288,7 +337,17 @@ def discover(topic: str, max_results: int = 10) -> list[db.Source]:
             continue
 
         # --- Fetch + clean text ----------------------------------------------
-        text = fetch_page_text(url)
+        try:
+            text = fetch_page_text(url)
+        except NotHTMLContentError as e:
+            log_event(
+                stage="discovery",
+                inputs={"url": url, "raw_url": raw_url, "title": title},
+                output={"content_type": e.content_type},
+                decision="skipped_non_html_content",
+            )
+            continue
+
         if not text:
             log_event(
                 stage="discovery",
