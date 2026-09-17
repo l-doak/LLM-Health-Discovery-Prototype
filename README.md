@@ -1,4 +1,4 @@
-# STEADI prototype — health content discovery & drafting pipeline
+# prototype — health content discovery & drafting pipeline
 
 A small prototype of a pipeline that discovers approved health-information
 sources, summarizes them for human review, turns approved sources into
