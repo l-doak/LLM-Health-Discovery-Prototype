@@ -8,8 +8,8 @@ and `docs/limitations.md` for the reasoning and honest gaps.
 
 ## Status
 
-**Stage 1 (discovery) is built and working.** Stages 2-6 (summarization,
-review, draft generation, evaluation, and full audit coverage of those
+**Stage 1 (discovery) and 2 (summarization) is built and working.** 
+Stages 3-6 (review, draft generation, evaluation, and full audit coverage of those
 stages) are not built yet — see `docs/limitations.md`.
 
 ## Setup
