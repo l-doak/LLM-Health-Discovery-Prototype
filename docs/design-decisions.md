@@ -168,6 +168,31 @@ check (`MIN_RAW_TEXT_CHARS = 50`), saves an API call on pages that
 fetched effectively empty (e.g. JS-rendered content BeautifulSoup
 couldn't see).
 
+**Oversized `raw_text` is truncated before the API call, and the
+truncation is audited.** `summarize.py` caps the text it sends at
+`MAX_RAW_TEXT_CHARS = 120_000` (roughly 30k tokens, well inside Claude's
+200k-token request limit). This is defense in depth: the incident that
+motivated it (a PDF mis-parsed as ~840,000 characters of HTML "text",
+producing a 676,409-token prompt) is fixed at its root in `discovery.py`
+(see the next section), but the cap means any *future* unexpectedly huge
+page degrades gracefully instead of failing the whole call. Three choices
+worth recording: (1) truncation only affects what is *sent* — the stored
+`Source.raw_text` is never modified, so stage 5 can still ground claims
+against the full original; (2) it is never silent — the "stored" audit
+event records `raw_text_chars`, `truncated`, and `chars_sent`; (3) it
+keeps the *start* of the page, on the assumption that the main content
+precedes trailing boilerplate. Trade-off, flagged in
+`docs/limitations.md`: a claim that only appears in the discarded tail
+can't appear in the summary.
+
+**Tests never write to the real audit log.** `audit.AUDIT_LOG_PATH` is a
+module-level constant, and the original tests didn't redirect it, so
+every `pytest` run appended test events (e.g. a "test topic" discovery
+search) to `data/audit_log.jsonl` — the file that is supposed to be a
+record of real runs. `tests/conftest.py` now has an autouse fixture that
+points it at a per-test temp file. Cheap to do, and a good example of why
+an audit trail needs protecting from the test suite too.
+
 
 ## Session 2 (continued) — non-HTML content handling in discovery.py
 
