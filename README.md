@@ -4,13 +4,13 @@ A small prototype of a pipeline that discovers approved health-information
 sources, summarizes them for human review, turns approved sources into
 structured app-content drafts, evaluates quality, and logs every step for
 auditability. Built as a portfolio piece — see `docs/design-decisions.md`
-and `docs/limitations.md` for the reasoning and honest gaps.
+and `docs/limitations.md` for the thinking during design and limitations of the current prototype.
 
 ## Status
 
 **Stage 1 (discovery) and 2 (summarization) is built and working.** 
 Stages 3-6 (review, draft generation, evaluation, and full audit coverage of those
-stages) are not built yet — see `docs/limitations.md`.
+stages) are not built yet.
 
 ## Setup
 
@@ -55,13 +55,13 @@ against a temporary throwaway database.
 ## Project layout
 
 ```
-steadi-prototype/
+prototype/
 ├── README.md
 ├── requirements.txt
 ├── .env.example              # copy to .env with real API keys
 ├── docs/
-│   ├── design-decisions.md   # why each non-obvious choice was made
-│   ├── limitations.md        # honest gaps vs. a production system
+│   ├── design-decisions.md   # why each choice was made
+│   ├── limitations.md        # gaps vs. a production system
 │   └── schema.md             # data model reference
 ├── src/
 │   ├── audit.py              # shared structured-logging helper
@@ -78,7 +78,7 @@ steadi-prototype/
 
 ## Next steps
 
-See `steadi-portfolio-plan.md` (project knowledge) for the full roadmap.
+See `portfolio-plan.md` (project knowledge) for the full roadmap.
 Immediately next: stage 2, structured summarization of stored sources
 using the Claude API, moving each source's status from `discovered` to
 `pending_review`.
