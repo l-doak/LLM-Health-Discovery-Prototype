@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import anthropic
 import pytest
 
-from src import db, summarize
+from src import audit, db, summarize
 
 
 @pytest.fixture
@@ -166,6 +166,61 @@ def test_summarize_source_gives_up_after_max_retries(sample_source, monkeypatch)
     assert fake_client.messages.create.call_count == summarize.MAX_RETRIES
     assert db.list_sources(status="discovered")[0].source_id == sample_source.source_id
     assert db.get_latest_summary(sample_source.source_id) is None
+
+
+def test_truncate_raw_text_leaves_short_text_alone():
+    text = "short page text " * 10
+    result, was_truncated = summarize._truncate_raw_text(text)
+    assert result == text
+    assert was_truncated is False
+
+
+def test_truncate_raw_text_caps_oversized_text():
+    text = "x" * (summarize.MAX_RAW_TEXT_CHARS + 5_000)
+    result, was_truncated = summarize._truncate_raw_text(text)
+    assert len(result) == summarize.MAX_RAW_TEXT_CHARS
+    assert was_truncated is True
+
+
+def test_summarize_source_truncates_oversized_raw_text(temp_db):
+    """An oversized page is capped before the API call, the stored Source
+    keeps its full text, and the truncation is recorded in the audit log.
+    """
+    oversized = db.Source(
+        url="https://www.nhs.uk/very-long-page",
+        domain="nhs.uk",
+        title="Very long page",
+        raw_text="a" * (summarize.MAX_RAW_TEXT_CHARS + 5_000),
+        status="discovered",
+    )
+    db.insert_source(oversized)
+
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = _make_fake_response(VALID_TOOL_INPUT)
+
+    result = summarize.summarize_source(fake_client, oversized)
+
+    assert result is True
+
+    # The prompt sent to the API contains the capped text, not all of it.
+    _, kwargs = fake_client.messages.create.call_args
+    prompt = kwargs["messages"][0]["content"]
+    assert prompt.count("a") <= summarize.MAX_RAW_TEXT_CHARS + 1_000  # + template text
+    assert "a" * (summarize.MAX_RAW_TEXT_CHARS + 1) not in prompt
+
+    # The database still holds the full, untruncated original.
+    stored_source = next(
+        s for s in db.list_sources() if s.source_id == oversized.source_id
+    )
+    assert len(stored_source.raw_text) == summarize.MAX_RAW_TEXT_CHARS + 5_000
+
+    # The audit log says so, rather than truncating silently.
+    events = audit.read_events(stage="summarize")
+    assert len(events) == 1
+    assert events[0]["decision"] == "stored"
+    assert events[0]["inputs"]["truncated"] is True
+    assert events[0]["inputs"]["raw_text_chars"] == summarize.MAX_RAW_TEXT_CHARS + 5_000
+    assert events[0]["inputs"]["chars_sent"] == summarize.MAX_RAW_TEXT_CHARS
 
 
 def test_run_summarization_counts_successes_and_failures(temp_db):

@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # requirements.txt already lists packages for stages that aren't built
+      # yet. sentence-transformers (which pulls in PyTorch) and chromadb are
+      # large and nothing tests them today, so skip them to keep CI fast.
+      # Remove this filter once a stage that uses them lands.
+      - name: Install dependencies
+        run: |
+          grep -v -E '^(sentence-transformers|chromadb)' requirements.txt > ci-requirements.txt
+          pip install -r ci-requirements.txt
+
+      # No API keys are needed: the Claude and Tavily calls are mocked and
+      # every test uses temporary database and audit-log files.
+      - name: Run tests
+        run: pytest -q

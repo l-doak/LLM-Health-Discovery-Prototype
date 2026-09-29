@@ -72,6 +72,16 @@ RETRY_BACKOFF_SECONDS = 2.0
 # pages that fetched empty/near-empty (e.g. JS-rendered content BS4 can't see).
 MIN_RAW_TEXT_CHARS = 50
 
+# Defense-in-depth cap on how much page text is sent to the API. ~120,000
+# characters is roughly 30k tokens, comfortably inside Claude's 200k-token
+# request limit even with the prompt template and tool schema added on top.
+# The root cause of the original oversize incident (a PDF mis-parsed as
+# HTML) is fixed in discovery.py; this cap exists so that *any* future
+# unexpectedly huge page degrades to "summarized from the first N chars"
+# instead of a failed API call. Truncation is never silent: it is recorded
+# in the audit log (see summarize_source).
+MAX_RAW_TEXT_CHARS = 120_000
+
 SUMMARY_PROMPT_TEMPLATE = """You are helping a clinical content team triage \
 health-information sources for older adults. Read the following page text \
 and produce a structured summary.
@@ -136,10 +146,26 @@ RECORD_SUMMARY_TOOL = {
 }
 
 
+def _truncate_raw_text(raw_text: str) -> tuple[str, bool]:
+    """Cap page text at MAX_RAW_TEXT_CHARS.
+
+    Returns (text_to_send, was_truncated). Pure function so the cap
+    behaviour can be tested without any API mocking.
+    """
+    if len(raw_text) <= MAX_RAW_TEXT_CHARS:
+        return raw_text, False
+    return raw_text[:MAX_RAW_TEXT_CHARS], True
+
+
 def _call_claude_for_summary(
-    client: anthropic.Anthropic, source: db.Source
+    client: anthropic.Anthropic, source: db.Source, raw_text: str
 ) -> tuple[dict[str, Any], str]:
     """Call Claude once, forced to use the record_summary tool.
+
+    `raw_text` is passed separately from `source` because the caller may
+    have truncated it (see _truncate_raw_text); the stored Source is never
+    modified, so the full original text stays available for later
+    grounding checks.
 
     Returns (tool_input, model_version). Raises anthropic's own exception
     types on API/transport errors, or ValueError if the model somehow
@@ -147,7 +173,7 @@ def _call_claude_for_summary(
     set, but we check rather than assume).
     """
     prompt = SUMMARY_PROMPT_TEMPLATE.format(
-        title=source.title, url=source.url, raw_text=source.raw_text
+        title=source.title, url=source.url, raw_text=raw_text
     )
 
     response = client.messages.create(
@@ -186,11 +212,25 @@ def summarize_source(client: anthropic.Anthropic, source: db.Source) -> bool:
         print(f"Skipping {source.url}: raw_text missing or too short")
         return False
 
+    text_to_send, was_truncated = _truncate_raw_text(source.raw_text)
+    # Recorded on the "stored" event below so a truncated summary is
+    # visibly distinguishable in the audit trail, not silently partial.
+    audit_inputs = {
+        "source_id": source.source_id,
+        "url": source.url,
+        "raw_text_chars": len(source.raw_text),
+        "truncated": was_truncated,
+    }
+    if was_truncated:
+        audit_inputs["chars_sent"] = len(text_to_send)
+
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            tool_input, model_version = _call_claude_for_summary(client, source)
+            tool_input, model_version = _call_claude_for_summary(
+                client, source, text_to_send
+            )
 
             summary = db.Summary(
                 source_id=source.source_id,
@@ -206,7 +246,7 @@ def summarize_source(client: anthropic.Anthropic, source: db.Source) -> bool:
 
             audit.log_event(
                 stage="summarize",
-                inputs={"source_id": source.source_id, "url": source.url},
+                inputs=audit_inputs,
                 output=summary.model_dump(),
                 decision="stored",
                 model=model_version,
@@ -230,7 +270,7 @@ def summarize_source(client: anthropic.Anthropic, source: db.Source) -> bool:
 
     audit.log_event(
         stage="summarize",
-        inputs={"source_id": source.source_id, "url": source.url},
+        inputs=audit_inputs,
         output={"error": str(last_error)},
         decision="failed",
         model=None,
